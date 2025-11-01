@@ -1,0 +1,372 @@
+# Cell 1: Install required libraries
+!pip install transformers datasets torch torchvision Pillow matplotlib scikit-learn --upgrade
+!pip install timm  # For advanced vision models
+
+# Cell 2: Import necessary libraries
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from transformers import AutoModelForImageClassification, AutoFeatureExtractor
+import timm
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Cell 3: Set up device and parameters
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Parameters
+BATCH_SIZE = 32
+IMG_SIZE = 224  # Standard size for most transformers
+NUM_CLASSES = 8  # anger, contempt, disgust, fear, happiness, neutral, sadness, surprise
+EMOTION_LABELS = ['anger', 'contempt', 'disgust', 'fear', 'happiness', 'neutral', 'sadness', 'surprise']
+NUM_EPOCHS = 15
+LR = 1e-4
+
+# Cell 4: Create custom dataset class
+class FERDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.classes = sorted(os.listdir(root_dir))
+        self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
+        self.samples = []
+        
+        for class_name in self.classes:
+            class_dir = os.path.join(root_dir, class_name)
+            for img_name in os.listdir(class_dir):
+                img_path = os.path.join(class_dir, img_name)
+                self.samples.append((img_path, self.class_to_idx[class_name]))
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        image = Image.open(img_path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+            
+        return image, label
+
+# Cell 5: Define data transforms with augmentation
+train_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+test_transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Cell 6: Load datasets
+# Update these paths to match your environment
+train_dir = '/kaggle/input/fer2013plus/fer2013plus/fer2013/train'
+test_dir = '/kaggle/input/fer2013plus/fer2013plus/fer2013/test'
+
+train_dataset = FERDataset(train_dir, transform=train_transform)
+test_dataset = FERDataset(test_dir, transform=test_transform)
+
+# Split training data into train and validation
+train_size = int(0.85 * len(train_dataset))
+val_size = len(train_dataset) - train_size
+train_dataset, val_dataset = torch.utils.data.random_split(train_dataset, [train_size, val_size])
+
+print(f"Training samples: {len(train_dataset)}")
+print(f"Validation samples: {len(val_dataset)}")
+print(f"Test samples: {len(test_dataset)}")
+
+# Create data loaders
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+
+# Cell 7: Define our novel model architecture
+class EmotionTransformer(nn.Module):
+    def __init__(self, model_name='vit_base_patch16_224', pretrained=True, num_classes=8):
+        super(EmotionTransformer, self).__init__()
+        
+        # Load pretrained vision transformer
+        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        
+        # Get feature dimension
+        self.feature_dim = self.backbone.num_features
+        
+        # Custom attention mechanism for facial regions
+        self.region_attention = nn.Sequential(
+            nn.Conv2d(self.feature_dim, 512, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(512, 8, kernel_size=1),  # 8 emotion regions
+            nn.Sigmoid()
+        )
+        
+        # Emotion-specific layers
+        self.emotion_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.feature_dim, 256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(256, 1)
+            ) for _ in range(num_classes)
+        ])
+        
+        # Final fusion layer
+        self.fusion = nn.Sequential(
+            nn.Linear(num_classes, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes)
+        )
+        
+    def forward(self, x):
+        # Extract features using backbone
+        features = self.backbone.forward_features(x)
+        
+        # Handle different output formats
+        if len(features.shape) == 4:  # Feature map
+            # Global average pooling
+            global_features = features.mean(dim=[2, 3])
+            
+            # Region attention
+            attention_map = self.region_attention(features)
+            region_features = (features * attention_map).mean(dim=[2, 3])
+        else:  # Token sequence
+            # Use CLS token
+            global_features = features[:, 0]
+            region_features = global_features
+        
+        # Emotion-specific predictions
+        emotion_outputs = []
+        for head in self.emotion_heads:
+            emotion_outputs.append(head(region_features))
+        
+        emotion_outputs = torch.cat(emotion_outputs, dim=1)
+        
+        # Fusion with global features
+        combined = torch.cat([global_features, emotion_outputs], dim=1)
+        output = self.fusion(emotion_outputs)
+        
+        return output
+
+# Cell 8: Initialize model, loss function, and optimizer
+model = EmotionTransformer(model_name='vit_base_patch16_224', pretrained=True, num_classes=NUM_CLASSES)
+model = model.to(device)
+
+# Loss function with class weights to handle imbalance
+class_counts = [0] * NUM_CLASSES
+for _, label in train_dataset:
+    class_counts[label] += 1
+
+class_weights = torch.tensor([max(class_counts) / count for count in class_counts], dtype=torch.float32).to(device)
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+# Optimizer with different learning rates for backbone and new layers
+optimizer = optim.AdamW([
+    {'params': model.backbone.parameters(), 'lr': LR/10},
+    {'params': model.region_attention.parameters(), 'lr': LR},
+    {'params': model.emotion_heads.parameters(), 'lr': LR},
+    {'params': model.fusion.parameters(), 'lr': LR}
+], weight_decay=1e-4)
+
+# Learning rate scheduler
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+
+# Cell 9: Training function
+def train_epoch(model, dataloader, criterion, optimizer, device):
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    
+    for images, labels in tqdm(dataloader, desc="Training"):
+        images, labels = images.to(device), labels.to(device)
+        
+        # Zero the parameter gradients
+        optimizer.zero_grad()
+        
+        # Forward pass
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+        
+        # Statistics
+        running_loss += loss.item() * images.size(0)
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+    
+    epoch_loss = running_loss / total
+    epoch_acc = correct / total
+    return epoch_loss, epoch_acc
+
+# Cell 10: Validation function
+def validate(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for images, labels in tqdm(dataloader, desc="Validation"):
+            images, labels = images.to(device), labels.to(device)
+            
+            # Forward pass
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            
+            # Statistics
+            running_loss += loss.item() * images.size(0)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    
+    epoch_loss = running_loss / total
+    epoch_acc = correct / total
+    return epoch_loss, epoch_acc, all_preds, all_labels
+
+# Cell 11: Train the model
+train_losses = []
+val_losses = []
+train_accs = []
+val_accs = []
+best_val_acc = 0.0
+
+for epoch in range(NUM_EPOCHS):
+    print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
+    
+    # Train
+    train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+    train_losses.append(train_loss)
+    train_accs.append(train_acc)
+    
+    # Validate
+    val_loss, val_acc, val_preds, val_labels = validate(model, val_loader, criterion, device)
+    val_losses.append(val_loss)
+    val_accs.append(val_acc)
+    
+    # Update learning rate
+    scheduler.step()
+    
+    # Print statistics
+    print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+    print(f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+    
+    # Save best model
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), 'best_emotion_model.pth')
+        print("Model saved!")
+    
+    print("-" * 50)
+
+print(f"Training complete. Best validation accuracy: {best_val_acc:.4f}")
+
+# Cell 12: Evaluate on test set
+# Load the best model
+model.load_state_dict(torch.load('best_emotion_model.pth'))
+model.eval()
+
+# Evaluate on test set
+test_loss, test_acc, test_preds, test_labels = validate(model, test_loader, criterion, device)
+print(f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}")
+
+# Classification report
+print("\nClassification Report:")
+print(classification_report(test_labels, test_preds, target_names=EMOTION_LABELS))
+
+# Confusion matrix
+cm = confusion_matrix(test_labels, test_preds)
+plt.figure(figsize=(10, 8))
+plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+plt.title('Confusion Matrix')
+plt.colorbar()
+tick_marks = np.arange(len(EMOTION_LABELS))
+plt.xticks(tick_marks, EMOTION_LABELS, rotation=45)
+plt.yticks(tick_marks, EMOTION_LABELS)
+
+plt.ylabel('True label')
+plt.xlabel('Predicted label')
+plt.tight_layout()
+plt.show()
+
+# Cell 13: Plot training history
+# Plot training & validation accuracy
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(train_accs, label='Train Accuracy')
+plt.plot(val_accs, label='Validation Accuracy')
+plt.title('Accuracy over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+# Plot training & validation loss
+plt.subplot(1, 2, 2)
+plt.plot(train_losses, label='Train Loss')
+plt.plot(val_losses, label='Validation Loss')
+plt.title('Loss over Epochs')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+# Cell 14: Visualize predictions
+def visualize_predictions(model, dataloader, device, num_images=6):
+    model.eval()
+    images_so_far = 0
+    fig = plt.figure(figsize=(15, 10))
+    
+    with torch.no_grad():
+        for i, (images, labels) in enumerate(dataloader):
+            images = images.to(device)
+            labels = labels.to(device)
+            
+            outputs = model(images)
+            _, preds = torch.max(outputs, 1)
+            
+            for j in range(images.size()[0]):
+                images_so_far += 1
+                ax = plt.subplot(2, 3, images_so_far)
+                ax.axis('off')
+                
+                # Convert tensor to image
+                img = images[j].cpu().numpy().transpose((1, 2, 0))
+                # Denormalize
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                img = std * img + mean
+                img = np.clip(img, 0, 1)
+                
+                ax.set_title(f"True: {EMOTION_LABELS[labels[j]]}\nPred: {EMOTION_LABELS[preds[j]]}")
+                plt.imshow(img)
+                
+                if images_so_far == num_images:
+                    return
+
+visualize_predictions(model, test_loader, device)
