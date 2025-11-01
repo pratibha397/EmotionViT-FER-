@@ -72,7 +72,7 @@ Facial emotion recognition using Vision Transformers with custom region attentio
 - 8GB+ RAM
 
 # Clone repository
-git clone https://github.com/pratibha397/EmotionViT-FER.git
+git clone https://github.com/pratibha397/EmotionViT-FER-.git
 cd EmotionViT-FER
 
 # Install dependencies
