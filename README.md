@@ -75,5 +75,3 @@ Facial emotion recognition using Vision Transformers with custom region attentio
 git clone https://github.com/pratibha397/EmotionViT-FER-.git
 cd EmotionViT-FER
 
-# Install dependencies
-pip install -r requirements.txt
